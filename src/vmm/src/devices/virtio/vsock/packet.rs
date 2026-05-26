@@ -232,7 +232,13 @@ impl VsockPacketTx {
             return Err(VsockError::InvalidPktLen(hdr.len));
         }
 
-        if hdr.len > self.buffer.len() - VSOCK_PKT_HDR_SIZE {
+        if hdr.len
+            > self
+                .buffer
+                .len()
+                .checked_sub(VSOCK_PKT_HDR_SIZE)
+                .ok_or(VsockError::DescChainTooShortForHeader(0))?
+        {
             return Err(VsockError::DescChainTooShortForPacket(
                 self.buffer.len(),
                 hdr.len,
@@ -258,8 +264,12 @@ impl VsockPacketTx {
             return Err(VsockError::GuestMemoryBounds);
         }
 
+        let start_addr = (offset as usize)
+            .checked_add(VSOCK_PKT_HDR_SIZE as usize)
+            .ok_or(VsockError::GuestMemoryBounds)?;
+
         self.buffer
-            .read_volatile_at(dst, (offset + VSOCK_PKT_HDR_SIZE) as usize, count as usize)
+            .read_volatile_at(dst, start_addr, count as usize)
             .map_err(|err| VsockError::GuestMemoryMmap(GuestMemoryError::from(err)))
             .and_then(|read| read.try_into().map_err(|_| VsockError::DescChainOverflow))
     }
@@ -364,8 +374,12 @@ impl VsockPacketRx {
             return Err(VsockError::GuestMemoryBounds);
         }
 
+        let start_addr = (offset as usize)
+            .checked_add(VSOCK_PKT_HDR_SIZE as usize)
+            .ok_or(VsockError::GuestMemoryBounds)?;
+
         self.buffer
-            .write_volatile_at(src, (offset + VSOCK_PKT_HDR_SIZE) as usize, count as usize)
+            .write_volatile_at(src, start_addr, count as usize)
             .map_err(|err| VsockError::GuestMemoryMmap(GuestMemoryError::from(err)))
             .and_then(|read| read.try_into().map_err(|_| VsockError::DescChainOverflow))
     }
@@ -691,5 +705,139 @@ mod tests {
             let res = pkt2.write_from_offset_to(&mut buf.as_mut_slice(), offset, count);
             assert!(matches!(res, Err(VsockError::GuestMemoryBounds)));
         }
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use vm_memory::{WriteVolatile, ReadVolatile, VolatileMemoryError};
+    use vm_memory::bitmap::BitmapSlice;
+    use vm_memory::VolatileSlice;
+
+    #[derive(Debug)]
+    struct MockWrite;
+    impl WriteVolatile for MockWrite {
+        fn write_volatile<B: BitmapSlice>(
+            &mut self,
+            _buf: &VolatileSlice<B>,
+        ) -> Result<usize, VolatileMemoryError> {
+            Ok(0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockRead;
+    impl ReadVolatile for MockRead {
+        fn read_volatile<B: BitmapSlice>(
+            &mut self,
+            _buf: &mut VolatileSlice<B>,
+        ) -> Result<usize, VolatileMemoryError> {
+            Ok(0)
+        }
+    }
+
+    static mut SYMBOLIC_LEN: u32 = 0;
+
+    #[kani::proof]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::len, stub_iovec_len)]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::read_volatile_at, stub_read_volatile_at)]
+    fn verify_vsock_packet_tx_write_bounds() {
+        unsafe { SYMBOLIC_LEN = kani::any() };
+        let offset: u32 = kani::any();
+        let count: u32 = kani::any();
+
+        let pkt = VsockPacketTx::default();
+
+        let mut dst = MockWrite;
+        let _ = pkt.write_from_offset_to(&mut dst, offset, count);
+    }
+
+    fn stub_iovec_len(_this: &crate::devices::virtio::iovec::IoVecBuffer) -> u32 {
+        unsafe { SYMBOLIC_LEN }
+    }
+
+    fn stub_read_volatile_at<W: WriteVolatile>(
+        _this: &crate::devices::virtio::iovec::IoVecBuffer,
+        _dst: &mut W,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<usize, VolatileMemoryError> {
+        Ok(0)
+    }
+
+    #[kani::proof]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBufferMut::len, stub_iovec_mut_len)]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBufferMut::write_volatile_at, stub_write_volatile_at)]
+    #[kani::stub(VsockPacketRx::new, stub_vsock_packet_rx_new)]
+    fn verify_vsock_packet_rx_read_bounds() {
+        unsafe { SYMBOLIC_LEN = kani::any() };
+        let offset: u32 = kani::any();
+        let count: u32 = kani::any();
+
+        let mut pkt = VsockPacketRx::new().unwrap();
+
+        let mut src = MockRead;
+        let res = pkt.read_at_offset_from(&mut src, offset, count);
+        
+        // Prevent Kani from trying to drop results or fake objects
+        std::mem::forget(res);
+        std::mem::forget(pkt);
+    }
+
+    fn stub_iovec_mut_len<const L: u16>(_this: &crate::devices::virtio::iovec::IoVecBufferMut<L>) -> u32 {
+        unsafe { SYMBOLIC_LEN }
+    }
+
+    fn stub_write_volatile_at<const L: u16, W: ReadVolatile>(
+        _this: &mut crate::devices::virtio::iovec::IoVecBufferMut<L>,
+        _src: &mut W,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<usize, VolatileMemoryError> {
+        Ok(0)
+    }
+
+    fn stub_vsock_packet_rx_new() -> Result<VsockPacketRx, VsockError> {
+        Ok(unsafe { std::mem::MaybeUninit::zeroed().assume_init() })
+    }
+
+    #[kani::proof]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::load_descriptor_chain, stub_load_descriptor_chain)]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::read_exact_volatile_at, stub_read_exact_volatile_at)]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::len, stub_iovec_len)]
+    fn verify_vsock_packet_tx_parse() {
+        unsafe { SYMBOLIC_LEN = kani::any() };
+        let mut pkt = VsockPacketTx::default();
+        
+        // Dummy values
+        let mut mem_uninit = std::mem::MaybeUninit::<GuestMemoryMmap>::zeroed();
+        let mem = unsafe { mem_uninit.assume_init_ref() };
+        let chain: DescriptorChain = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+
+        let res = pkt.parse(mem, chain);
+
+        // Prevent problematic drops
+        std::mem::forget(res);
+        std::mem::forget(pkt);
+    }
+
+    fn stub_load_descriptor_chain(
+        _this: &mut crate::devices::virtio::iovec::IoVecBuffer,
+        _mem: &GuestMemoryMmap,
+        _head: DescriptorChain,
+    ) -> Result<(), crate::devices::virtio::iovec::IoVecError> {
+        Ok(())
+    }
+
+    fn stub_read_exact_volatile_at(
+        _this: &crate::devices::virtio::iovec::IoVecBuffer,
+        buf: &mut [u8],
+        _offset: usize,
+    ) -> Result<(), VolatileMemoryError> {
+        for x in buf.iter_mut() {
+            *x = kani::any();
+        }
+        Ok(())
     }
 }
