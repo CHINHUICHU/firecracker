@@ -817,6 +817,47 @@ mod tests {
 }
 
 #[cfg(kani)]
+impl IoVecBuffer {
+    /// Build an `IoVecBuffer` that reports `len` bytes but has no backing iovecs.
+    ///
+    /// Intended for proof harnesses (e.g. the vsock packet parser) that stub out the actual
+    /// memory transfer and only need a buffer whose reported `len()` is symbolic. Real I/O on
+    /// this buffer would transfer 0 bytes; harnesses must not rely on its contents.
+    pub(crate) fn with_len(len: u32) -> Self {
+        Self {
+            vecs: Vec::new(),
+            len,
+        }
+    }
+}
+
+#[cfg(kani)]
+impl<const L: u16> IoVecBufferMut<L> {
+    /// Build an `IoVecBufferMut` that reports `len` bytes but holds no iovecs.
+    ///
+    /// Intended for proof harnesses that do not exercise the actual transfer (an empty deque
+    /// makes the read/write loops no-ops). The backing buffer is allocated so the struct is
+    /// well-formed, but it is NOT a real `mmap`, so callers MUST `std::mem::forget` the buffer
+    /// to avoid `IovDeque::drop`'s `munmap`, which Kani cannot model.
+    pub(crate) fn with_len(len: u32) -> Self {
+        // SAFETY: the layout has non-zero size.
+        let mem = unsafe {
+            std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(
+                2 * crate::arch::GUEST_PAGE_SIZE,
+                crate::arch::GUEST_PAGE_SIZE,
+            ))
+        };
+        let vecs = IovDeque::<L> {
+            iov: mem.cast(),
+            start: 0,
+            len: 0,
+            capacity: L,
+        };
+        Self { vecs, len }
+    }
+}
+
+#[cfg(kani)]
 #[allow(dead_code)] // Avoid warning when using stubs
 mod verification {
     use std::mem::ManuallyDrop;

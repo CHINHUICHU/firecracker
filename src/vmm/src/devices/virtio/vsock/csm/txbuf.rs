@@ -148,6 +148,118 @@ impl WriteVolatile for TxBuf {
     }
 }
 
+#[cfg(kani)]
+#[allow(dead_code)] // Avoid warnings for helpers unused on a given path.
+mod verification {
+    use std::io::Write;
+
+    use super::*;
+
+    // The TX ring buffer is `CONN_TX_BUF_SIZE` (64 KiB) in production. We keep that real size, so
+    // the modular `head % SIZE` arithmetic and the slice-bound proofs match production exactly.
+    //
+    // The *pushed* slice length, on the other hand, is bounded to a small value. The two slice
+    // indexings that could panic in `push` -- `data[head_ofs..head_ofs + len]` and
+    // `data[..src.len() - len]` -- depend on `head_ofs` (kept fully symbolic over its whole
+    // `[0, SIZE)` range) and on the *relation* between `src.len()` and `SIZE - head_ofs`, not on
+    // the absolute magnitude of `src.len()`. A small symbolic `src.len()` against a fully symbolic
+    // `head_ofs` therefore still exercises the no-wrap copy, the wrap-around copy, and the boundary
+    // at exactly `SIZE`, while keeping the real byte copy cheap for the solver. This mirrors the
+    // bounded-length modelling choice already made by the `iovec.rs` harnesses (`MAX_DESC_LENGTH`).
+    const MAX_PUSH_LEN: usize = 4;
+
+    /// A `Write` endpoint that accepts an arbitrary, contract-respecting number of bytes.
+    ///
+    /// A real `write` may make only partial progress, so this returns any value in `0..=buf.len()`.
+    /// That drives every branch of `flush_to`: the early "incomplete write" return and the
+    /// full-write recursion.
+    #[derive(Debug)]
+    struct KaniSink;
+
+    impl Write for KaniSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(kani::any_where(|&n| n <= buf.len()))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a `TxBuf` with fully symbolic ring offsets, upholding the one structural invariant the
+    /// real code maintains: the used length (`head - tail`) never exceeds `SIZE`.
+    fn any_txbuf(allocated: bool) -> TxBuf {
+        let head: u32 = kani::any();
+        let tail: u32 = kani::any();
+        kani::assume((Wrapping(head) - Wrapping(tail)).0 as usize <= TxBuf::SIZE);
+
+        let data = if allocated {
+            Some(vec![0u8; TxBuf::SIZE].into_boxed_slice())
+        } else {
+            None
+        };
+
+        TxBuf {
+            data,
+            head: Wrapping(head),
+            tail: Wrapping(tail),
+        }
+    }
+
+    // Proof: `TxBuf::push` is panic-free for an arbitrary ring state and an arbitrary (bounded)
+    // source slice, and on success preserves the buffer invariant while advancing `head` by exactly
+    // `src.len()`.
+    //
+    // The properties of interest are the two slice indexings inside `push`:
+    //   - `data[head_ofs..head_ofs + len]`, and
+    //   - `data[..src.len() - len]` (the wrap-around copy).
+    // Kani checks neither can go out of bounds for any `head_ofs` in `[0, SIZE)`, and that the
+    // `self.len() + src.len()` capacity check cannot overflow.
+    #[kani::proof]
+    #[kani::unwind(5)] // the inner byte-copy loop runs up to `MAX_PUSH_LEN` times; +1 for the assertion
+    #[kani::solver(cadical)]
+    fn verify_txbuf_push_no_panic() {
+        // Cover both the lazily-unallocated and already-allocated states.
+        let mut txbuf = any_txbuf(kani::any());
+
+        let mut backing = [0u8; MAX_PUSH_LEN];
+        let src_len: usize = kani::any_where(|&n| n <= MAX_PUSH_LEN);
+        let src = VolatileSlice::from(&mut backing[..src_len]);
+
+        let len_before = txbuf.len();
+
+        match txbuf.push(&src) {
+            Ok(()) => {
+                // The push fit: the invariant still holds and exactly `src_len` bytes were
+                // accounted for.
+                assert!(txbuf.len() <= TxBuf::SIZE);
+                assert_eq!(txbuf.len(), len_before + src_len);
+            }
+            Err(_) => {
+                // Rejected for lack of room. The only requirement on this path is no panic.
+            }
+        }
+    }
+
+    // Proof: `TxBuf::flush_to` is panic-free for an arbitrary ring state and preserves the buffer
+    // invariant. The concerns mirror `push`: the `data[tail_ofs..tail_ofs + len_to_write]` slice
+    // index, the `written + <recursive flush>` addition, and the bounded recursion (tail-to-end,
+    // then start-to-head, then the empty-buffer base case).
+    #[kani::proof]
+    #[kani::unwind(4)] // <=3 recursive `flush_to` calls; +1 to discharge the unwinding assertion
+    #[kani::solver(cadical)]
+    fn verify_txbuf_flush_to_no_panic() {
+        // `flush_to` unwraps `data` whenever the buffer is non-empty, so start from an allocated
+        // buffer.
+        let mut txbuf = any_txbuf(true);
+        let mut sink = KaniSink;
+
+        let _ = txbuf.flush_to(&mut sink);
+
+        assert!(txbuf.len() <= TxBuf::SIZE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Error as IoError, ErrorKind, Write};
