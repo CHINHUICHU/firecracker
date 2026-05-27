@@ -260,9 +260,9 @@ impl VsockPacketTx {
         // A zero-length transfer is a no-op. This guard is also load-bearing: without it the
         // bounds check below (`0 > X`) is vacuously false for any `offset`, letting an
         // arbitrary `offset` reach `offset + VSOCK_PKT_HDR_SIZE` below and overflow `u32`.
-        // if count == 0 {
-        //     return Ok(0);
-        // }
+        if count == 0 {
+            return Ok(0);
+        }
         if count
             > self
                 .buffer
@@ -372,9 +372,9 @@ impl VsockPacketRx {
         // A zero-length transfer is a no-op. This guard is also load-bearing: without it the
         // bounds check below (`0 > X`) is vacuously false for any `offset`, letting an
         // arbitrary `offset` reach `offset + VSOCK_PKT_HDR_SIZE` below and overflow `u32`.
-        // if count == 0 {
-        //     return Ok(0);
-        // }
+        if count == 0 {
+            return Ok(0);
+        }
         if count
             > self
                 .buffer

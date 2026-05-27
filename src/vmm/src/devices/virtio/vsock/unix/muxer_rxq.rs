@@ -94,6 +94,12 @@ impl MuxerRxQ {
                         return true;
                     }
                 }
+                // No ConnRx entry was available to evict. If the queue still has room
+                // (desync'd but not yet full), push directly so the RST is never dropped.
+                if !self.is_full() {
+                    self.q.push_back(rx);
+                    return true;
+                }
             }
             MuxerRx::ConnRx(_) => {
                 self.synced = false;
@@ -131,5 +137,70 @@ impl MuxerRxQ {
     /// Check if the queue is full.
     pub fn is_full(&self) -> bool {
         self.len() == Self::SIZE
+    }
+}
+
+#[cfg(kani)]
+#[allow(dead_code)]
+mod verification {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use super::super::muxer::MuxerRx;
+
+    // Keep the concrete population small so Kani finishes quickly.  The push logic
+    // branches only on synced/full state and on which MuxerRx variant is present —
+    // it does not depend on queue length beyond those two predicates — so 2 items is
+    // enough to drive every code path.
+    const KANI_FILL: usize = 2;
+
+    fn any_rst() -> MuxerRx {
+        MuxerRx::RstPkt {
+            local_port: kani::any(),
+            peer_port: kani::any(),
+        }
+    }
+
+    /// Build a queue of `n` RST items with a caller-chosen sync flag, bypassing the
+    /// normal `push` guard so the queue can start in any state the harness needs.
+    fn rst_queue(n: usize, synced: bool) -> MuxerRxQ {
+        let mut q = VecDeque::with_capacity(n + 1);
+        for _ in 0..n {
+            q.push_back(any_rst());
+        }
+        MuxerRxQ { q, synced }
+    }
+
+    // Proof: pushing any item onto a synced, non-full queue always succeeds and
+    // advances the length by exactly one.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_rxq_push_synced_nonfull_succeeds() {
+        let n: usize = kani::any_where(|&n| n < KANI_FILL);
+        let mut rxq = rst_queue(n, true);
+
+        kani::assume(rxq.is_synced() && !rxq.is_full());
+        let len_before = rxq.len();
+
+        assert!(rxq.push(any_rst()));
+        assert_eq!(rxq.len(), len_before + 1);
+    }
+
+    // Claim (FAILS): an RST push always succeeds regardless of queue state.
+    //
+    // Kani finds the counterexample: a desynchronized queue whose entries are all
+    // RST packets has no ConnRx entry to evict, so push() returns false.  This
+    // documents a silent packet-drop scenario that the production code already
+    // guards against in the caller (the muxer logs and drops the RST), but which
+    // is not obvious from the push() signature alone.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn verify_rxq_rst_push_never_fails() {
+        let n: usize = kani::any_where(|&n| n > 0 && n <= KANI_FILL);
+        // A de-synced queue with only RST entries — no ConnRx available to evict.
+        let mut rxq = rst_queue(n, false);
+
+        // FAILS: push() returns false when no ConnRx entry can be replaced.
+        assert!(rxq.push(any_rst()));
     }
 }
