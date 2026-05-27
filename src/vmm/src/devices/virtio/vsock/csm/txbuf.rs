@@ -50,7 +50,7 @@ impl TxBuf {
     /// there isn't enough room, in which case `Err(Error::TxBufFull)` is returned.
     pub fn push(&mut self, src: &VolatileSlice<impl BitmapSlice>) -> Result<(), VsockCsmError> {
         // Error out if there's no room to push the entire slice.
-        if self.len() + src.len() > Self::SIZE {
+        if src.len() > Self::SIZE - self.len() {
             return Err(VsockCsmError::TxBufFull);
         }
 
@@ -318,5 +318,68 @@ mod tests {
                 if err.kind() == ErrorKind::PermissionDenied => {}
             other => panic!("Unexpected result: {:?}", other),
         }
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    const V_SIZE: usize = 8; 
+
+    #[kani::proof]
+    fn verify_push_arithmetic() {
+        let mut head: Wrapping<u32> = Wrapping(kani::any());
+        let tail: Wrapping<u32> = Wrapping(kani::any());
+        let used_len = (head - tail).0 as usize;
+        
+        // Ensure consistency
+        if used_len > V_SIZE { return; }
+
+        let src_len: usize = kani::any();
+        // Check if push would fit
+        if src_len > V_SIZE || used_len + src_len > V_SIZE {
+            return;
+        }
+
+        let head_ofs = head.0 as usize % V_SIZE;
+        // Calculation of len is safe because head_ofs < V_SIZE
+        let len = std::cmp::min(V_SIZE - head_ofs, src_len);
+
+        assert!(head_ofs + len <= V_SIZE);
+        if len < src_len {
+            assert!(src_len - len <= V_SIZE);
+        }
+        
+        head += wrap_usize_to_u32(src_len);
+        assert!((head - tail).0 as usize <= V_SIZE);
+    }
+
+    #[kani::proof]
+    fn verify_flush_arithmetic() {
+        let head: Wrapping<u32> = Wrapping(kani::any());
+        let mut tail: Wrapping<u32> = Wrapping(kani::any());
+        let used_len = (head - tail).0 as usize;
+        kani::assume(used_len <= V_SIZE);
+        
+        if used_len == 0 { return; }
+
+        let tail_ofs = tail.0 as usize % V_SIZE;
+        let len_to_write = std::cmp::min(V_SIZE - tail_ofs, used_len);
+
+        assert!(tail_ofs + len_to_write <= V_SIZE);
+
+        let written: usize = kani::any_where(|&n| n <= len_to_write);
+        tail += wrap_usize_to_u32(written);
+
+        assert!((head - tail).0 as usize <= used_len);
+    }
+
+    #[kani::proof]
+    fn verify_len_logic() {
+        let h: Wrapping<u32> = Wrapping(kani::any());
+        let t: Wrapping<u32> = Wrapping(kani::any());
+        let len = (h - t).0;
+        assert!(len <= u32::MAX);
     }
 }

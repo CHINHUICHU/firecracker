@@ -480,18 +480,164 @@ mod tests {
         // A warning is, however, logged, if the guest driver attempts to write any config data.
         ctx.device.write_config(0, &data[..4]);
 
-        // Test a bad activation.
-        // let bad_activate = ctx.device.activate(
-        //     ctx.mem.clone(),
-        // );
-        // match bad_activate {
-        //     Err(ActivateError::BadActivate) => (),
-        //     other => panic!("{:?}", other),
-        // }
-
-        // Test a correct activation.
+        // Test correct activation.
         ctx.device
             .activate(ctx.mem.clone(), ctx.interrupt.clone())
             .unwrap();
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use std::sync::Arc;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use vmm_sys_util::epoll::EventSet;
+    use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
+    use crate::devices::virtio::vsock::{VsockChannel, VsockEpollListener};
+    use crate::vstate::memory::{GuestMemory, GuestMemoryMmap};
+    use crate::vstate::interrupts::InterruptError;
+    
+    #[derive(Debug)]
+    struct MockBackend;
+    impl VsockChannel for MockBackend {
+        fn recv_pkt(&mut self, _pkt: &mut VsockPacketRx) -> Result<(), VsockError> {
+            if kani::any() { Ok(()) } else { Err(VsockError::NoData) }
+        }
+        fn send_pkt(&mut self, _pkt: &VsockPacketTx) -> Result<(), VsockError> {
+            if kani::any() { Ok(()) } else { Err(VsockError::NoData) }
+        }
+        fn has_pending_rx(&self) -> bool { kani::any() }
+    }
+    impl AsRawFd for MockBackend { fn as_raw_fd(&self) -> RawFd { 0 } }
+    impl VsockEpollListener for MockBackend {
+        fn get_polled_evset(&self) -> EventSet { EventSet::empty() }
+        fn notify(&mut self, _evset: EventSet) {}
+    }
+    impl VsockBackend for MockBackend {}
+
+    #[derive(Debug)]
+    struct MockInterrupt;
+    impl VirtioInterrupt for MockInterrupt {
+        fn trigger(&self, _int_type: VirtioInterruptType) -> std::result::Result<(), InterruptError> { Ok(()) }
+        fn trigger_queues(&self, _queues: &[u16]) -> std::result::Result<(), InterruptError> { Ok(()) }
+        fn status(&self) -> Arc<std::sync::atomic::AtomicU32> { Arc::new(std::sync::atomic::AtomicU32::new(0)) }
+    }
+
+    fn stub_rx_new() -> Result<VsockPacketRx, VsockError> {
+        Ok(unsafe { std::mem::MaybeUninit::zeroed().assume_init() })
+    }
+    fn stub_eventfd_new(_flags: i32) -> std::io::Result<EventFd> {
+        Ok(unsafe { std::mem::zeroed() })
+    }
+    fn stub_eventfd_write(_this: &EventFd, _val: u64) -> std::io::Result<()> { Ok(()) }
+    fn stub_queue_initialize<M: GuestMemory>(_this: &mut VirtQueue, _mem: &M) -> Result<(), crate::devices::virtio::queue::QueueError> { Ok(()) }
+    fn stub_rx_parse(_this: &mut VsockPacketRx, _mem: &GuestMemoryMmap, _head: crate::devices::virtio::queue::DescriptorChain) -> Result<(), VsockError> {
+        if kani::any() { Ok(()) } else { Err(VsockError::NoData) }
+    }
+    fn stub_rx_commit_hdr(_this: &mut VsockPacketRx) -> Result<(), VsockError> {
+        if kani::any() { Ok(()) } else { Err(VsockError::NoData) }
+    }
+    fn stub_queue_pop(_this: &mut VirtQueue) -> Result<Option<crate::devices::virtio::queue::DescriptorChain>, InvalidAvailIdx> {
+        static mut CALLED: bool = false;
+        if unsafe { !CALLED } {
+            unsafe { CALLED = true };
+            Ok(Some(unsafe { std::mem::zeroed() }))
+        } else {
+            Ok(None)
+        }
+    }
+    fn stub_queue_add_used(_this: &mut VirtQueue, _index: u16, _len: u32) -> Result<(), crate::devices::virtio::queue::QueueError> { Ok(()) }
+    fn stub_queue_advance(_this: &mut VirtQueue) {}
+    fn stub_queue_kick(_this: &mut VirtQueue) -> bool { kani::any() }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::new, stub_eventfd_new)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::write, stub_eventfd_write)]
+    #[kani::stub(VsockPacketRx::new, stub_rx_new)]
+    fn verify_read_config_bounds() {
+        let backend = MockBackend;
+        let vsock = Vsock {
+            cid: kani::any(),
+            queues: Vec::new(),
+            queue_events: Vec::new(),
+            backend,
+            avail_features: 0,
+            acked_features: 0,
+            activate_evt: unsafe { std::mem::zeroed() },
+            device_state: DeviceState::Inactive,
+            rx_packet: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+            tx_packet: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+        };
+        let offset: u64 = kani::any();
+        kani::assume(offset == 0);
+        
+        let mut data = [0u8; 8];
+        let len: usize = kani::any_where(|&n| n <= 8);
+        vsock.read_config(offset, &mut data[..len]);
+        std::mem::forget(vsock);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    #[kani::stub(VirtQueue::initialize, stub_queue_initialize)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::new, stub_eventfd_new)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::write, stub_eventfd_write)]
+    #[kani::stub(VsockPacketRx::new, stub_rx_new)]
+    fn verify_activate_logic() {
+        let backend = MockBackend;
+        let mut vsock = Vsock {
+            cid: kani::any(),
+            queues: vec![VirtQueue::new(256), VirtQueue::new(256), VirtQueue::new(256)],
+            queue_events: Vec::new(),
+            backend,
+            avail_features: 0,
+            acked_features: 0,
+            activate_evt: unsafe { std::mem::zeroed() },
+            device_state: DeviceState::Inactive,
+            rx_packet: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+            tx_packet: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+        };
+        let mut mem_uninit = std::mem::MaybeUninit::<GuestMemoryMmap>::zeroed();
+        let mem = unsafe { mem_uninit.assume_init() };
+        let interrupt = Arc::new(MockInterrupt) as Arc<dyn VirtioInterrupt>;
+        let res = vsock.activate(mem, Arc::clone(&interrupt));
+        std::mem::forget(res);
+        std::mem::forget(interrupt);
+        std::mem::forget(vsock);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    #[kani::stub(VsockPacketRx::parse, stub_rx_parse)]
+    #[kani::stub(VsockPacketRx::commit_hdr, stub_rx_commit_hdr)]
+    #[kani::stub(VirtQueue::pop_or_enable_notification, stub_queue_pop)]
+    #[kani::stub(VirtQueue::add_used, stub_queue_add_used)]
+    #[kani::stub(VirtQueue::advance_used_ring_idx, stub_queue_advance)]
+    #[kani::stub(VirtQueue::prepare_kick, stub_queue_kick)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::new, stub_eventfd_new)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::write, stub_eventfd_write)]
+    #[kani::stub(VsockPacketRx::new, stub_rx_new)]
+    fn verify_process_rx_safety() {
+        let backend = MockBackend;
+        let mut vsock = Vsock {
+            cid: kani::any(),
+            queues: vec![VirtQueue::new(256), VirtQueue::new(256), VirtQueue::new(256)],
+            queue_events: Vec::new(),
+            backend,
+            avail_features: 0,
+            acked_features: 0,
+            activate_evt: unsafe { std::mem::zeroed() },
+            device_state: DeviceState::Inactive,
+            rx_packet: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+            tx_packet: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+        };
+        let mut mem_uninit = std::mem::MaybeUninit::<GuestMemoryMmap>::zeroed();
+        let mem = unsafe { mem_uninit.assume_init() };
+        let interrupt = Arc::new(MockInterrupt);
+        vsock.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
+        let _ = vsock.process_rx();
+        std::mem::forget(vsock);
     }
 }

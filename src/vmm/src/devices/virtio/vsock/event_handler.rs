@@ -58,8 +58,15 @@ where
             error!("Failed to get vsock rx queue event: {:?}", err);
             METRICS.rx_queue_event_fails.inc();
         } else if self.backend.has_pending_rx() {
-            if self.process_rx().unwrap() {
-                used_queues.push(RXQ_INDEX.try_into().unwrap());
+            match self.process_rx() {
+                Ok(true) => {
+                    used_queues.push(RXQ_INDEX.try_into().unwrap());
+                }
+                Ok(false) => (),
+                Err(err) => {
+                    error!("vsock: error processing rx queue: {:?}", err);
+                    METRICS.rx_queue_event_fails.inc();
+                }
             }
             METRICS.rx_queue_event_count.inc();
         }
@@ -78,15 +85,31 @@ where
             error!("Failed to get vsock tx queue event: {:?}", err);
             METRICS.tx_queue_event_fails.inc();
         } else {
-            if self.process_tx().unwrap() {
-                used_queues.push(TXQ_INDEX.try_into().unwrap());
+            match self.process_tx() {
+                Ok(true) => {
+                    used_queues.push(TXQ_INDEX.try_into().unwrap());
+                }
+                Ok(false) => (),
+                Err(err) => {
+                    error!("vsock: error processing tx queue: {:?}", err);
+                    METRICS.tx_queue_event_fails.inc();
+                }
             }
             METRICS.tx_queue_event_count.inc();
             // The backend may have queued up responses to the packets we sent during
             // TX queue processing. If that happened, we need to fetch those responses
             // and place them into RX buffers.
-            if self.backend.has_pending_rx() && self.process_rx().unwrap() {
-                used_queues.push(RXQ_INDEX.try_into().unwrap());
+            if self.backend.has_pending_rx() {
+                match self.process_rx() {
+                    Ok(true) => {
+                        used_queues.push(RXQ_INDEX.try_into().unwrap());
+                    }
+                    Ok(false) => (),
+                    Err(err) => {
+                        error!("vsock: error processing rx queue: {:?}", err);
+                        METRICS.rx_queue_event_fails.inc();
+                    }
+                }
             }
         }
         used_queues
@@ -200,7 +223,13 @@ where
                     self.handle_evq_event(evset);
                     Vec::new()
                 }
-                Self::PROCESS_NOTIFY_BACKEND => self.notify_backend(evset).unwrap(),
+                Self::PROCESS_NOTIFY_BACKEND => match self.notify_backend(evset) {
+                    Ok(used_queues) => used_queues,
+                    Err(err) => {
+                        error!("vsock: error notifying backend: {:?}", err);
+                        Vec::new()
+                    }
+                },
                 _ => {
                     warn!("Unexpected vsock event received: {:?}", source);
                     Vec::new()
@@ -611,5 +640,108 @@ mod tests {
             assert_eq!(guest_rxvq.used.idx.get(), 1);
             assert_eq!(guest_txvq.used.idx.get(), 1);
         }
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use vmm_sys_util::epoll::EventSet;
+    use vmm_sys_util::eventfd::EventFd;
+    use crate::devices::virtio::queue::InvalidAvailIdx;
+    use crate::devices::virtio::device::DeviceState;
+    use crate::devices::virtio::vsock::{VsockChannel, VsockEpollListener, VsockError, VsockPacketRx, VsockPacketTx};
+
+    #[derive(Debug)]
+    struct MockBackend;
+    impl VsockChannel for MockBackend {
+        fn recv_pkt(&mut self, _: &mut VsockPacketRx) -> Result<(), VsockError> { Ok(()) }
+        fn send_pkt(&mut self, _: &VsockPacketTx) -> Result<(), VsockError> { Ok(()) }
+        fn has_pending_rx(&self) -> bool { kani::any() }
+    }
+    impl AsRawFd for MockBackend { fn as_raw_fd(&self) -> RawFd { 0 } }
+    impl VsockEpollListener for MockBackend {
+        fn get_polled_evset(&self) -> EventSet { EventSet::empty() }
+        fn notify(&mut self, _: EventSet) {}
+    }
+    impl VsockBackend for MockBackend {}
+
+    // Stubs to simulate errors that trigger panics in unwrap()
+    fn stub_process_rx<B: VsockBackend + Debug>(_this: &mut Vsock<B>) -> Result<bool, InvalidAvailIdx> {
+        if kani::any() { 
+            Ok(kani::any()) 
+        } else { 
+            Err(unsafe { std::mem::zeroed() }) 
+        }
+    }
+
+    fn stub_process_tx<B: VsockBackend + Debug>(_this: &mut Vsock<B>) -> Result<bool, InvalidAvailIdx> {
+        if kani::any() { 
+            Ok(kani::any()) 
+        } else { 
+            Err(unsafe { std::mem::zeroed() }) 
+        }
+    }
+
+    fn stub_notify_backend<B: VsockBackend + Debug>(_this: &mut Vsock<B>, _evset: EventSet) -> Result<Vec<u16>, InvalidAvailIdx> {
+        if kani::any() { 
+            Ok(Vec::new()) 
+        } else { 
+            Err(unsafe { std::mem::zeroed() }) 
+        }
+    }
+
+    #[kani::proof]
+    #[kani::stub(Vsock::<MockBackend>::process_rx, stub_process_rx)]
+    fn verify_handle_rxq_event_panic() {
+        let mut vsock_uninit = std::mem::MaybeUninit::<Vsock<MockBackend>>::zeroed();
+        let mut vsock = unsafe { vsock_uninit.assume_init() };
+        
+        vsock.queue_events = vec![unsafe { std::mem::zeroed() }];
+        vsock.backend = MockBackend;
+
+        // This will panic if stub_process_rx returns Err
+        let _ = vsock.handle_rxq_event(EventSet::IN);
+        
+        std::mem::forget(vsock);
+    }
+
+    #[kani::proof]
+    #[kani::stub(Vsock::<MockBackend>::process_tx, stub_process_tx)]
+    #[kani::stub(Vsock::<MockBackend>::process_rx, stub_process_rx)]
+    fn verify_handle_txq_event_panic() {
+        let mut vsock_uninit = std::mem::MaybeUninit::<Vsock<MockBackend>>::zeroed();
+        let mut vsock = unsafe { vsock_uninit.assume_init() };
+        
+        vsock.queue_events = vec![unsafe { std::mem::zeroed() }, unsafe { std::mem::zeroed() }];
+        vsock.backend = MockBackend;
+
+        // This will panic if stubs return Err
+        let _ = vsock.handle_txq_event(EventSet::IN);
+        
+        std::mem::forget(vsock);
+    }
+
+    #[kani::proof]
+    #[kani::stub(Vsock::<MockBackend>::notify_backend, stub_notify_backend)]
+    fn verify_process_panic() {
+        let mut vsock_uninit = std::mem::MaybeUninit::<Vsock<MockBackend>>::zeroed();
+        let mut vsock = unsafe { vsock_uninit.assume_init() };
+        
+        vsock.device_state = DeviceState::Activated(unsafe { std::mem::zeroed() });
+        vsock.backend = MockBackend;
+
+        let event = event_manager::Events::with_data(
+            &MockBackend,
+            Vsock::<MockBackend>::PROCESS_NOTIFY_BACKEND,
+            EventSet::IN
+        );
+        let mut ops = unsafe { std::mem::zeroed() };
+
+        // This will panic if notify_backend returns Err
+        vsock.process(event, &mut ops);
+        
+        std::mem::forget(vsock);
     }
 }

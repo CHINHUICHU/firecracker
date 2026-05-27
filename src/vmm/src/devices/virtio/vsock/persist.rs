@@ -220,3 +220,89 @@ pub(crate) mod tests {
         assert_eq!(data, [0u8, 1, 2, 3, 4, 5, 6, 7]);
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use vmm_sys_util::epoll::EventSet;
+    use crate::devices::virtio::persist::{QueueState, VirtioDeviceState, QueueConstructorArgs};
+    use crate::devices::virtio::queue::{Queue, QueueError};
+    use vmm_sys_util::eventfd::EventFd;
+    
+    fn any_queue_state() -> QueueState {
+        unsafe {
+            let mut qs: QueueState = std::mem::MaybeUninit::zeroed().assume_init();
+            let p = &mut qs as *mut QueueState;
+            std::ptr::write(p, std::mem::transmute([kani::any::<u8>(); std::mem::size_of::<QueueState>()]));
+            qs
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::stub(vmm_sys_util::eventfd::EventFd::new, stub_eventfd_new)]
+    #[kani::stub(VsockPacketRx::new, stub_rx_new)]
+    #[kani::stub(Queue::restore, stub_queue_restore)]
+    fn verify_vsock_restore_safety() {
+        let mut virtio_state_uninit = std::mem::MaybeUninit::<VirtioDeviceState>::zeroed();
+        let mut virtio_state = unsafe { virtio_state_uninit.assume_init() };
+        
+        // Manual implementation for VirtioDeviceType which doesn't implement Arbitrary
+        virtio_state.device_type = if kani::any() { 
+            VirtioDeviceType::Vsock 
+        } else { 
+            VirtioDeviceType::Net 
+        };
+        virtio_state.avail_features = kani::any();
+        virtio_state.acked_features = kani::any();
+        virtio_state.activated = kani::any();
+        
+        // FIXED SIZE LOOP: Avoid symbolic length for unwinding
+        virtio_state.queues = Vec::new();
+        virtio_state.queues.push(any_queue_state());
+        virtio_state.queues.push(any_queue_state());
+        virtio_state.queues.push(any_queue_state());
+
+        let state = VsockFrontendState {
+            cid: kani::any(),
+            virtio_state,
+        };
+
+        let mut mem_uninit = std::mem::MaybeUninit::<GuestMemoryMmap>::zeroed();
+        let mem = unsafe { mem_uninit.assume_init() };
+        
+        #[derive(Debug)]
+        struct MockBackend;
+        impl VsockChannel for MockBackend {
+            fn recv_pkt(&mut self, _: &mut VsockPacketRx) -> Result<(), VsockError> { Ok(()) }
+            fn send_pkt(&mut self, _: &VsockPacketTx) -> Result<(), VsockError> { Ok(()) }
+            fn has_pending_rx(&self) -> bool { false }
+        }
+        impl AsRawFd for MockBackend { fn as_raw_fd(&self) -> RawFd { 0 } }
+        impl VsockEpollListener for MockBackend {
+            fn get_polled_evset(&self) -> EventSet { EventSet::empty() }
+            fn notify(&mut self, _: EventSet) {}
+        }
+        impl VsockBackend for MockBackend {}
+
+        let args = VsockConstructorArgs {
+            mem,
+            backend: MockBackend,
+        };
+
+        let res = Vsock::restore(args, &state);
+        std::mem::forget(res);
+        std::mem::forget(state);
+    }
+
+    fn stub_rx_new() -> Result<VsockPacketRx, VsockError> {
+        Ok(unsafe { std::mem::MaybeUninit::zeroed().assume_init() })
+    }
+    fn stub_eventfd_new(_flags: i32) -> std::io::Result<EventFd> {
+        Ok(unsafe { std::mem::zeroed() })
+    }
+    fn stub_queue_restore<T>(_args: QueueConstructorArgs, _state: &QueueState) -> Result<Queue, QueueError> {
+        Ok(unsafe { std::mem::MaybeUninit::zeroed().assume_init() })
+    }
+}

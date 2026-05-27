@@ -822,6 +822,56 @@ mod verification {
         std::mem::forget(pkt);
     }
 
+    #[kani::proof]
+    fn verify_vsock_packet_header_accessors() {
+        let mut hdr = VsockPacketHeader::default();
+
+        let src_cid: u64 = kani::any();
+        hdr.set_src_cid(src_cid);
+        assert_eq!(hdr.src_cid(), src_cid);
+
+        let dst_cid: u64 = kani::any();
+        hdr.set_dst_cid(dst_cid);
+        assert_eq!(hdr.dst_cid(), dst_cid);
+
+        let src_port: u32 = kani::any();
+        hdr.set_src_port(src_port);
+        assert_eq!(hdr.src_port(), src_port);
+
+        let dst_port: u32 = kani::any();
+        hdr.set_dst_port(dst_port);
+        assert_eq!(hdr.dst_port(), dst_port);
+
+        let len: u32 = kani::any();
+        hdr.set_len(len);
+        assert_eq!(hdr.len(), len);
+
+        let type_: u16 = kani::any();
+        hdr.set_type(type_);
+        assert_eq!(hdr.type_(), type_);
+
+        let op: u16 = kani::any();
+        hdr.set_op(op);
+        assert_eq!(hdr.op(), op);
+
+        let flags: u32 = kani::any();
+        hdr.set_flags(flags);
+        assert_eq!(hdr.flags(), flags);
+
+        let flag: u32 = kani::any();
+        let old_flags = hdr.flags();
+        hdr.set_flag(flag);
+        assert_eq!(hdr.flags(), old_flags | flag);
+
+        let buf_alloc: u32 = kani::any();
+        hdr.set_buf_alloc(buf_alloc);
+        assert_eq!(hdr.buf_alloc(), buf_alloc);
+
+        let fwd_cnt: u32 = kani::any();
+        hdr.set_fwd_cnt(fwd_cnt);
+        assert_eq!(hdr.fwd_cnt(), fwd_cnt);
+    }
+
     fn stub_load_descriptor_chain(
         _this: &mut crate::devices::virtio::iovec::IoVecBuffer,
         _mem: &GuestMemoryMmap,
@@ -839,5 +889,27 @@ mod verification {
             *x = kani::any();
         }
         Ok(())
+    }
+
+    #[kani::proof]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::len, stub_iovec_len)]
+    #[kani::stub(crate::devices::virtio::iovec::IoVecBuffer::read_volatile_at, stub_read_volatile_at)]
+    fn verify_vsock_packet_tx_write_zero_count() {
+        unsafe { SYMBOLIC_LEN = kani::any() };
+        let offset: u32 = kani::any();
+        let count: u32 = 0;
+
+        let pkt = VsockPacketTx::default();
+
+        let mut dst = MockWrite;
+        let res = pkt.write_from_offset_to(&mut dst, offset, count);
+        
+        // If it passes the bounds check (which it should for count=0), it should return Ok(0)
+        if let Ok(val) = res {
+            assert_eq!(val, 0);
+        }
+
+        std::mem::forget(res);
+        std::mem::forget(pkt);
     }
 }
