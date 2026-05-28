@@ -163,8 +163,13 @@ mod verification {
 
     /// Build a queue of `n` RST items with a caller-chosen sync flag, bypassing the
     /// normal `push` guard so the queue can start in any state the harness needs.
+    ///
+    /// Capacity is fixed to `KANI_FILL + 1` (a concrete constant) rather than `n + 1`
+    /// (symbolic). A symbolic capacity forces Kani to model heap allocation with a
+    /// symbolic size, making all pointer arithmetic inside the VecDeque symbolic and
+    /// causing state-space explosion in the iteration loop inside `push()`.
     fn rst_queue(n: usize, synced: bool) -> MuxerRxQ {
-        let mut q = VecDeque::with_capacity(n + 1);
+        let mut q = VecDeque::with_capacity(KANI_FILL + 1);
         for _ in 0..n {
             q.push_back(any_rst());
         }
